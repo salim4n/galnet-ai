@@ -2,7 +2,7 @@
 
 A futuristic Elite Dangerous themed chat application built with Next.js 15, React 19, and TypeScript. Experience real-time AI interactions in an immersive command interface inspired by the Elite Dangerous universe.
 
-[![Deployed on Vercel](https://img.shields.io/badge/Deployed%20on-Vercel-black?style=for-the-badge&logo=vercel)]([https://vercel.com/salim-laimeches-projects/v0-elite-dangerous-chat-app](https://v0-elite-dangerous-chat-app.vercel.app/))
+[![Deployed on Vercel](https://img.shields.io/badge/Deployed%20on-Vercel-black?style=for-the-badge&logo=vercel)](https://galnet-ai.vercel.app/))
 
 ## 🚀 Features
 
@@ -122,5 +122,4 @@ This project is private and not open for public contribution.
 
 ## 🔗 Links
 
-- **Live Demo**: [Vercel Deployment](https://vercel.com/salim-laimeches-projects/v0-elite-dangerous-chat-app)
-- **v0.dev Project**: [Continue Building](https://v0.dev/chat/projects/OU2YSkiVe2P)
+- **Live Demo**: [Vercel Deployment](https://galnet-ai.vercel.app/)
