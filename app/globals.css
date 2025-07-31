@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 0%;
+    --foreground: 39 100% 65%;
+    --card: 0 0% 0%;
+    --card-foreground: 39 100% 65%;
+    --popover: 0 0% 0%;
+    --popover-foreground: 39 100% 65%;
+    --primary: 39 100% 50%;
+    --primary-foreground: 0 0% 0%;
+    --secondary: 39 50% 10%;
+    --secondary-foreground: 39 100% 65%;
+    --muted: 39 50% 5%;
+    --muted-foreground: 39 50% 40%;
+    --accent: 39 50% 10%;
+    --accent-foreground: 39 100% 65%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 39 50% 20%;
+    --input: 39 50% 10%;
+    --ring: 39 100% 50%;
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Custom scrollbar */
+.scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: rgba(255, 165, 0, 0.1);
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(255, 165, 0, 0.5);
+  border-radius: 2px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 165, 0, 0.7);
+}
+
+/* Glow effects */
+.glow-orange {
+  box-shadow: 0 0 20px rgba(255, 165, 0, 0.3);
+}
+
+/* Animation for typing indicator */
+@keyframes pulse-glow {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 5px rgba(255, 165, 0, 0.5);
+  }
+  50% {
+    opacity: 0.5;
+    box-shadow: 0 0 10px rgba(255, 165, 0, 0.8);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Gradient animation for processing button */
+@keyframes gradient-x {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.animate-gradient-x {
+  animation: gradient-x 2s ease infinite;
+  background-size: 200% 200%;
+}
+
+/* Streaming text animation */
+@keyframes typing {
+  from { width: 0 }
+  to { width: 100% }
+}
+
+@keyframes blink-caret {
+  from, to { border-color: transparent }
+  50% { border-color: #ffa500; }
+}
