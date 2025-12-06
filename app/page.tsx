@@ -3,7 +3,7 @@
 import type React from "react"
 
 import { useState, useRef, useEffect } from "react"
-import { startGalnetChat, continueGalnetChat, GalnetApiError, type Suggestion } from "@/lib/galnet-api"
+import { streamGalnetChat, GalnetApiError, type Suggestion } from "@/lib/galnet-api"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -61,6 +61,7 @@ export default function EliteDangerousChat() {
   const scrollAreaRef = useRef<HTMLDivElement>(null)
   const [showAboutModal, setShowAboutModal] = useState(false)
   const [currentSuggestions, setCurrentSuggestions] = useState<Suggestion[]>([])
+  const [streamingContent, setStreamingContent] = useState("")
 
   // Suggested queries for new users
   const suggestedQueries = [
@@ -93,73 +94,67 @@ export default function EliteDangerousChat() {
     setInputValue("")
     setIsTyping(true)
     setError(null)
+    setStreamingContent("")
 
-    try {
-      let response
-      
-      if (threadId) {
-        response = await continueGalnetChat(threadId, messageText)
-      } else {
-        response = await startGalnetChat(messageText)
-        setThreadId(response.threadId)
-      }
+    let accumulatedContent = ""
+    const messageId = (Date.now() + 1).toString()
 
-      const finalAnswer = response.message || 'No response from GALNET agent'
-
-      const aiMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        content: finalAnswer,
-        sender: "galnet",
-        timestamp: new Date(),
-        suggestions: response.suggestions,
-      }
-
-      setMessages((prev) => [...prev, aiMessage])
-      setCurrentSuggestions(response.suggestions || [])
-    } catch (error) {
-      console.error('Galnet API Error:', error)
-      
-      let errorMessage = "Connection to GALNET network failed. Please try again."
-      
-      if (error instanceof GalnetApiError) {
-        if (error.code === 404) {
-          setThreadId(null)
-          errorMessage = "Session expired. Starting new conversation..."
-          try {
-            const response = await startGalnetChat(messageText)
-            setThreadId(response.threadId)
-            const finalAnswer = response.message || 'No response from GALNET agent'
-            
-            const aiMessage: Message = {
-              id: (Date.now() + 1).toString(),
-              content: finalAnswer,
-              sender: "galnet",
-              timestamp: new Date(),
-              suggestions: response.suggestions,
-            }
-            setMessages((prev) => [...prev, aiMessage])
-            setCurrentSuggestions(response.suggestions || [])
-            setIsTyping(false)
-            return
-          } catch (retryError) {
-            errorMessage = "Unable to establish GALNET connection. Please check your network."
-          }
-        } else {
-          errorMessage = `GALNET Error: ${error.message}`
+    await streamGalnetChat(messageText, threadId, {
+      onStart: (responseId) => {
+        console.log("[Stream] Started, responseId:", responseId)
+        // Add empty message that will be updated
+        const aiMessage: Message = {
+          id: messageId,
+          content: "",
+          sender: "galnet",
+          timestamp: new Date(),
         }
-      }
+        setMessages((prev) => [...prev, aiMessage])
+      },
+      onDelta: (content) => {
+        accumulatedContent += content
+        setStreamingContent(accumulatedContent)
+        // Update the message content
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === messageId ? { ...msg, content: accumulatedContent } : msg
+          )
+        )
+      },
+      onDone: (responseId) => {
+        console.log("[Stream] Done, responseId:", responseId)
+        setThreadId(responseId)
+        setIsTyping(false)
+        setStreamingContent("")
+        setCurrentSuggestions([])
+      },
+      onError: (err) => {
+        console.error("[Stream] Error:", err)
+        const errorMessage = err instanceof GalnetApiError
+          ? `GALNET Error: ${err.message}`
+          : "Connection to GALNET network failed. Please try again."
 
-      setError(errorMessage)
-      const errorAiMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        content: errorMessage,
-        sender: "galnet",
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, errorAiMessage])
-    } finally {
-      setIsTyping(false)
-    }
+        setError(errorMessage)
+        // Update or add error message
+        if (accumulatedContent) {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === messageId ? { ...msg, content: accumulatedContent || errorMessage } : msg
+            )
+          )
+        } else {
+          const errorAiMessage: Message = {
+            id: messageId,
+            content: errorMessage,
+            sender: "galnet",
+            timestamp: new Date(),
+          }
+          setMessages((prev) => [...prev, errorAiMessage])
+        }
+        setIsTyping(false)
+        setStreamingContent("")
+      },
+    })
   }
 
   const handleSendMessage = async () => {
@@ -284,7 +279,7 @@ export default function EliteDangerousChat() {
               </div>
             ))}
 
-            {isTyping && (
+            {isTyping && !streamingContent && (
               <div className="flex justify-start flex-col space-y-4">
                 <ProgressIndicator isProcessing={isTyping} />
                 <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 backdrop-blur-sm">

@@ -82,6 +82,104 @@ interface ResponsesApiResponse {
   };
 }
 
+// Types for streaming events
+interface StreamEvent {
+  type: string;
+  delta?: string;
+  response_id?: string;
+  item_id?: string;
+  content_index?: number;
+  output_index?: number;
+  response?: ResponsesApiResponse;
+}
+
+/**
+ * Start a streaming conversation with the Azure AI Foundry agent
+ * Returns a ReadableStream that emits SSE-formatted events
+ */
+export async function startAzureAgentChatStream(
+  message: string,
+  agentType: string,
+  previousResponseId?: string
+): Promise<ReadableStream<Uint8Array>> {
+  const token = await getToken();
+  const url = getResponsesUrl();
+
+  console.log(`[Azure Agent] Starting streaming chat with agent: ${agentName}`);
+
+  const body: Record<string, unknown> = {
+    agent: { type: "agent_reference", name: agentName },
+    input: message,
+    stream: true
+  };
+
+  if (previousResponseId) {
+    body.previous_response_id = previousResponseId;
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`[Azure Agent] Error: ${errorText}`);
+    throw new Error(`Azure API error: ${response.status} - ${errorText}`);
+  }
+
+  if (!response.body) {
+    throw new Error("No response body");
+  }
+
+  // Transform Azure's SSE format to our own SSE format
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let responseId = "";
+
+  const transformStream = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const text = decoder.decode(chunk, { stream: true });
+      const lines = text.split("\n");
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6);
+          if (data === "[DONE]") {
+            // Send final event with response ID
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done", responseId })}\n\n`));
+            continue;
+          }
+
+          try {
+            const event = JSON.parse(data) as StreamEvent;
+
+            // Handle different event types
+            if (event.type === "response.created" && event.response?.id) {
+              responseId = event.response.id;
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "start", responseId })}\n\n`));
+            } else if (event.type === "response.output_text.delta" && event.delta) {
+              // Text delta - send the actual text content
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "delta", content: event.delta })}\n\n`));
+            } else if (event.type === "response.completed") {
+              // Response completed
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done", responseId })}\n\n`));
+            }
+          } catch {
+            // Ignore parse errors for incomplete JSON
+          }
+        }
+      }
+    }
+  });
+
+  return response.body.pipeThrough(transformStream);
+}
+
 /**
  * Start a new conversation with the Azure AI Foundry agent using Responses API
  */

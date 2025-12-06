@@ -113,6 +113,84 @@ export async function continueGalnetChat(
   })
 }
 
+// Streaming chat types
+interface StreamEvent {
+  type: "start" | "delta" | "done"
+  content?: string
+  responseId?: string
+}
+
+interface StreamCallbacks {
+  onStart?: (responseId: string) => void
+  onDelta?: (content: string) => void
+  onDone?: (responseId: string) => void
+  onError?: (error: Error) => void
+}
+
+/**
+ * Start a streaming chat with the Galnet agent
+ */
+export async function streamGalnetChat(
+  message: string,
+  threadId: string | null,
+  callbacks: StreamCallbacks
+): Promise<void> {
+  try {
+    const response = await fetch('/api/agent/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message,
+        threadId: threadId || undefined
+      }),
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new GalnetApiError(`Stream error: ${response.status} - ${errorText}`, response.status)
+    }
+
+    if (!response.body) {
+      throw new GalnetApiError('No response body')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ""
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split("\n\n")
+      buffer = lines.pop() || ""
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          try {
+            const event = JSON.parse(line.slice(6)) as StreamEvent
+
+            if (event.type === "start" && event.responseId) {
+              callbacks.onStart?.(event.responseId)
+            } else if (event.type === "delta" && event.content) {
+              callbacks.onDelta?.(event.content)
+            } else if (event.type === "done" && event.responseId) {
+              callbacks.onDone?.(event.responseId)
+            }
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+  } catch (error) {
+    callbacks.onError?.(error instanceof Error ? error : new Error(String(error)))
+  }
+}
+
 // Extract final answer from the ReAct format response
 export function extractFinalAnswer(response: string | undefined | null): string {
   // Handle undefined, null, or empty responses
