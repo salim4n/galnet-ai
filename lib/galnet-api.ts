@@ -1,15 +1,5 @@
 // API service for Galnet agent integration
-
-interface StartChatRequest {
-  agentType: "galnet"
-  message: string
-}
-
-interface ContinueChatRequest {
-  threadId: string
-  message: string
-  agentType: "galnet"
-}
+// Uses local Next.js API routes that connect to Azure AI Foundry
 
 interface Suggestion {
   question: string
@@ -42,27 +32,15 @@ class GalnetApiError extends Error {
   }
 }
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'https://votre-api.com'
-
-// Debug environment variable loading
-console.log('API_BASE_URL loaded:', API_BASE_URL)
-
-// Helper function to properly construct API URLs
-function buildApiUrl(endpoint: string): string {
-  const baseUrl = API_BASE_URL.endsWith('/') ? API_BASE_URL.slice(0, -1) : API_BASE_URL
-  const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`
-  return `${baseUrl}${cleanEndpoint}`
-}
-
 async function makeApiRequest<T>(
   endpoint: string,
   requestData: unknown
 ): Promise<T> {
-  const url = buildApiUrl(endpoint)
-  console.log('Making API request to:', url) // Debug log
-  
+  console.log('[GALNET-API] Making request to:', endpoint)
+  console.log('[GALNET-API] Request data:', JSON.stringify(requestData))
+
   try {
-    const response = await fetch(url, {
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -70,26 +48,44 @@ async function makeApiRequest<T>(
       body: JSON.stringify(requestData),
     })
 
+    console.log('[GALNET-API] Response status:', response.status, response.statusText)
+
     if (!response.ok) {
-      const errorData: ApiError = await response.json().catch(() => ({
-        message: 'Unknown error occurred'
-      }))
+      const errorText = await response.text()
+      console.error('[GALNET-API] Error response:', errorText)
+      let errorData: ApiError
+      try {
+        errorData = JSON.parse(errorText)
+      } catch {
+        errorData = { message: 'Unknown error occurred' }
+      }
       throw new GalnetApiError(
         errorData.message || `HTTP ${response.status}: ${response.statusText}`,
         response.status
       )
     }
 
-    const data = await response.json()
-    console.log('API response received:', data) // Debug log
-    
+    const text = await response.text()
+    console.log('[GALNET-API] Response text:', text.substring(0, 200))
+
+    let data: T
+    try {
+      data = JSON.parse(text)
+    } catch (parseError) {
+      console.error('[GALNET-API] JSON parse error:', parseError)
+      throw new GalnetApiError('Failed to parse API response')
+    }
+
+    console.log('[GALNET-API] Parsed data:', JSON.stringify(data).substring(0, 200))
+
     // Validate the response structure
     if (!data || typeof data !== 'object') {
       throw new GalnetApiError('Invalid response format from API')
     }
-    
+
     return data
   } catch (error) {
+    console.error('[GALNET-API] Error:', error)
     if (error instanceof GalnetApiError) {
       throw error
     }
@@ -100,25 +96,99 @@ async function makeApiRequest<T>(
 }
 
 export async function startGalnetChat(message: string): Promise<ApiResponse> {
-  const request: StartChatRequest = {
-    agentType: "galnet",
-    message
-  }
-
-  return makeApiRequest<ApiResponse>('/v2/agent/start-chat', request)
+  return makeApiRequest<ApiResponse>('/api/agent', {
+    message,
+    agentType: "galnet"
+  })
 }
 
 export async function continueGalnetChat(
   threadId: string,
   message: string
 ): Promise<ApiResponse> {
-  const request: ContinueChatRequest = {
-    threadId,
+  return makeApiRequest<ApiResponse>('/api/agent', {
     message,
-    agentType: "galnet"
-  }
+    agentType: "galnet",
+    threadId
+  })
+}
 
-  return makeApiRequest<ApiResponse>('/v2/agent/continue-chat', request)
+// Streaming chat types
+interface StreamEvent {
+  type: "start" | "delta" | "done"
+  content?: string
+  responseId?: string
+}
+
+interface StreamCallbacks {
+  onStart?: (responseId: string) => void
+  onDelta?: (content: string) => void
+  onDone?: (responseId: string) => void
+  onError?: (error: Error) => void
+}
+
+/**
+ * Start a streaming chat with the Galnet agent
+ */
+export async function streamGalnetChat(
+  message: string,
+  threadId: string | null,
+  callbacks: StreamCallbacks
+): Promise<void> {
+  try {
+    const response = await fetch('/api/agent/stream', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message,
+        threadId: threadId || undefined
+      }),
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new GalnetApiError(`Stream error: ${response.status} - ${errorText}`, response.status)
+    }
+
+    if (!response.body) {
+      throw new GalnetApiError('No response body')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ""
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split("\n\n")
+      buffer = lines.pop() || ""
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          try {
+            const event = JSON.parse(line.slice(6)) as StreamEvent
+
+            if (event.type === "start" && event.responseId) {
+              callbacks.onStart?.(event.responseId)
+            } else if (event.type === "delta" && event.content) {
+              callbacks.onDelta?.(event.content)
+            } else if (event.type === "done" && event.responseId) {
+              callbacks.onDone?.(event.responseId)
+            }
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+    }
+  } catch (error) {
+    callbacks.onError?.(error instanceof Error ? error : new Error(String(error)))
+  }
 }
 
 // Extract final answer from the ReAct format response
