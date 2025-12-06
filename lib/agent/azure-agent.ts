@@ -1,10 +1,14 @@
 import { DefaultAzureCredential } from "@azure/identity";
+import { trace, SpanStatusCode, context, propagation } from "@opentelemetry/api";
 import type { AgentChatResponse } from "./types";
 
 // Configuration from environment
 const projectEndpoint = process.env.AZURE_EXISTING_AIPROJECT_ENDPOINT || "";
 const agentName = process.env.AZURE_EXISTING_AGENT_ID?.split(":")[0] || "galnet";
 const apiVersion = "2025-11-15-preview";
+
+// OpenTelemetry tracer
+const tracer = trace.getTracer("galnet-ai", "1.0.0");
 
 // Cached token
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -14,23 +18,36 @@ const credential = new DefaultAzureCredential();
  * Get a valid Azure token, refreshing if needed
  */
 async function getToken(): Promise<string> {
-  const now = Date.now();
-  // Refresh token 5 minutes before expiry
-  if (cachedToken && cachedToken.expiresAt > now + 5 * 60 * 1000) {
-    return cachedToken.token;
-  }
+  return tracer.startActiveSpan("getToken", async (span) => {
+    try {
+      const now = Date.now();
+      // Refresh token 5 minutes before expiry
+      if (cachedToken && cachedToken.expiresAt > now + 5 * 60 * 1000) {
+        span.setAttribute("token.cached", true);
+        span.end();
+        return cachedToken.token;
+      }
 
-  const tokenResponse = await credential.getToken("https://ai.azure.com/.default");
-  if (!tokenResponse) {
-    throw new Error("Failed to get Azure token");
-  }
+      span.setAttribute("token.cached", false);
+      const tokenResponse = await credential.getToken("https://ai.azure.com/.default");
+      if (!tokenResponse) {
+        throw new Error("Failed to get Azure token");
+      }
 
-  cachedToken = {
-    token: tokenResponse.token,
-    expiresAt: tokenResponse.expiresOnTimestamp
-  };
+      cachedToken = {
+        token: tokenResponse.token,
+        expiresAt: tokenResponse.expiresOnTimestamp
+      };
 
-  return cachedToken.token;
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      return cachedToken.token;
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
+      span.end();
+      throw error;
+    }
+  });
 }
 
 /**
@@ -76,6 +93,11 @@ interface ResponsesApiResponse {
       text?: string;
     }>;
   }>;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
   error?: {
     message: string;
     code: string;
@@ -91,6 +113,16 @@ interface StreamEvent {
   content_index?: number;
   output_index?: number;
   response?: ResponsesApiResponse;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
+}
+
+// Generate a unique conversation ID
+function generateConversationId(): string {
+  return `conv_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
 /**
@@ -100,84 +132,149 @@ interface StreamEvent {
 export async function startAzureAgentChatStream(
   message: string,
   agentType: string,
-  previousResponseId?: string
+  previousResponseId?: string,
+  conversationId?: string
 ): Promise<ReadableStream<Uint8Array>> {
-  const token = await getToken();
-  const url = getResponsesUrl();
+  return tracer.startActiveSpan("startAzureAgentChatStream", async (span) => {
+    // Use provided conversation ID or generate a new one
+    const convId = conversationId || generateConversationId();
 
-  console.log(`[Azure Agent] Starting streaming chat with agent: ${agentName}`);
+    span.setAttribute("agent.name", agentName);
+    span.setAttribute("agent.type", agentType);
+    span.setAttribute("message.length", message.length);
+    span.setAttribute("conversation.continued", !!previousResponseId);
+    span.setAttribute("conversation.id", convId);
 
-  const body: Record<string, unknown> = {
-    agent: { type: "agent_reference", name: agentName },
-    input: message,
-    stream: true
-  };
+    try {
+      const token = await getToken();
+      const url = getResponsesUrl();
 
-  if (previousResponseId) {
-    body.previous_response_id = previousResponseId;
-  }
+      console.log(`[Azure Agent] Starting streaming chat with agent: ${agentName}`);
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
+      const body: Record<string, unknown> = {
+        agent: { type: "agent_reference", name: agentName },
+        input: message,
+        stream: true
+      };
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Azure Agent] Error: ${errorText}`);
-    throw new Error(`Azure API error: ${response.status} - ${errorText}`);
-  }
+      if (previousResponseId) {
+        body.previous_response_id = previousResponseId;
+        span.setAttribute("previous_response_id", previousResponseId);
+      }
 
-  if (!response.body) {
-    throw new Error("No response body");
-  }
+      const fetchSpan = tracer.startSpan("fetch.responses.stream", {}, context.active());
+      fetchSpan.setAttribute("http.method", "POST");
+      fetchSpan.setAttribute("http.url", url);
 
-  // Transform Azure's SSE format to our own SSE format
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  let responseId = "";
+      // Inject trace context headers for distributed tracing
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "x-ms-azsdk-telemetry": `galnet-ai;conversation_id=${convId}`,
+      };
+      propagation.inject(context.active(), headers);
 
-  const transformStream = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      const text = decoder.decode(chunk, { stream: true });
-      const lines = text.split("\n");
+      // Add metadata to request body for Azure AI Foundry tracing
+      body.metadata = {
+        conversation_id: convId,
+        source: "galnet-ai",
+      };
 
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6);
-          if (data === "[DONE]") {
-            // Send final event with response ID
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done", responseId })}\n\n`));
-            continue;
-          }
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
 
-          try {
-            const event = JSON.parse(data) as StreamEvent;
+      fetchSpan.setAttribute("http.status_code", response.status);
 
-            // Handle different event types
-            if (event.type === "response.created" && event.response?.id) {
-              responseId = event.response.id;
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "start", responseId })}\n\n`));
-            } else if (event.type === "response.output_text.delta" && event.delta) {
-              // Text delta - send the actual text content
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "delta", content: event.delta })}\n\n`));
-            } else if (event.type === "response.completed") {
-              // Response completed
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done", responseId })}\n\n`));
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[Azure Agent] Error: ${errorText}`);
+        fetchSpan.setStatus({ code: SpanStatusCode.ERROR, message: errorText });
+        fetchSpan.end();
+        span.setStatus({ code: SpanStatusCode.ERROR, message: errorText });
+        span.end();
+        throw new Error(`Azure API error: ${response.status} - ${errorText}`);
+      }
+
+      fetchSpan.setStatus({ code: SpanStatusCode.OK });
+      fetchSpan.end();
+
+      if (!response.body) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: "No response body" });
+        span.end();
+        throw new Error("No response body");
+      }
+
+      // Transform Azure's SSE format to our own SSE format
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      let responseId = "";
+      let inputTokens = 0;
+      let outputTokens = 0;
+      const streamStartTime = performance.now();
+
+      const transformStream = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          const text = decoder.decode(chunk, { stream: true });
+          const lines = text.split("\n");
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const data = line.slice(6);
+              if (data === "[DONE]") {
+                const durationMs = performance.now() - streamStartTime;
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  type: "done",
+                  responseId,
+                  usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+                  duration_ms: durationMs
+                })}\n\n`));
+                continue;
+              }
+
+              try {
+                const event = JSON.parse(data) as StreamEvent;
+
+                if (event.type === "response.created" && event.response?.id) {
+                  responseId = event.response.id;
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "start", responseId })}\n\n`));
+                } else if (event.type === "response.output_text.delta" && event.delta) {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "delta", content: event.delta })}\n\n`));
+                } else if (event.type === "response.completed") {
+                  // Capture usage stats from completed event
+                  if (event.response?.usage) {
+                    inputTokens = event.response.usage.input_tokens;
+                    outputTokens = event.response.usage.output_tokens;
+                  }
+                  const durationMs = performance.now() - streamStartTime;
+                  // Log metrics for tracing
+                  console.log(`[Azure Agent] Stream completed - Response: ${responseId}, Duration: ${(durationMs/1000).toFixed(2)}s, Tokens: ${inputTokens} in / ${outputTokens} out`);
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                    type: "done",
+                    responseId,
+                    usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+                    duration_ms: durationMs
+                  })}\n\n`));
+                }
+              } catch {
+                // Ignore parse errors for incomplete JSON
+              }
             }
-          } catch {
-            // Ignore parse errors for incomplete JSON
           }
         }
-      }
+      });
+
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      return response.body.pipeThrough(transformStream);
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
+      span.end();
+      throw error;
     }
   });
-
-  return response.body.pipeThrough(transformStream);
 }
 
 /**
@@ -185,57 +282,97 @@ export async function startAzureAgentChatStream(
  */
 export async function startAzureAgentChat(
   message: string,
-  agentType: string
+  agentType: string,
+  conversationId?: string
 ): Promise<AgentChatResponse> {
-  const startTime = performance.now();
+  return tracer.startActiveSpan("startAzureAgentChat", async (span) => {
+    const startTime = performance.now();
+    const convId = conversationId || generateConversationId();
 
-  const token = await getToken();
-  const url = getResponsesUrl();
+    span.setAttribute("agent.name", agentName);
+    span.setAttribute("agent.type", agentType);
+    span.setAttribute("message.length", message.length);
+    span.setAttribute("conversation.id", convId);
 
-  console.log(`[Azure Agent] Starting chat with agent: ${agentName}`);
-  console.log(`[Azure Agent] URL: ${url}`);
+    try {
+      const token = await getToken();
+      const url = getResponsesUrl();
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      agent: { type: "agent_reference", name: agentName },
-      input: message
-    }),
+      console.log(`[Azure Agent] Starting chat with agent: ${agentName}, conversation: ${convId}`);
+      console.log(`[Azure Agent] URL: ${url}`);
+
+      const fetchSpan = tracer.startSpan("fetch.responses", {}, context.active());
+      fetchSpan.setAttribute("http.method", "POST");
+      fetchSpan.setAttribute("http.url", url);
+
+      // Inject trace context headers for distributed tracing
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "x-ms-azsdk-telemetry": `galnet-ai;conversation_id=${convId}`,
+      };
+      propagation.inject(context.active(), headers);
+
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          agent: { type: "agent_reference", name: agentName },
+          input: message,
+          metadata: {
+            conversation_id: convId,
+            source: "galnet-ai",
+          }
+        }),
+      });
+
+      const duration = ((performance.now() - startTime) / 1000).toFixed(2);
+      console.log(`[Azure Agent] Response received in ${duration}s - Status: ${response.status}`);
+
+      fetchSpan.setAttribute("http.status_code", response.status);
+      fetchSpan.setAttribute("response.duration_s", parseFloat(duration));
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[Azure Agent] Error: ${errorText}`);
+        fetchSpan.setStatus({ code: SpanStatusCode.ERROR, message: errorText });
+        fetchSpan.end();
+        throw new Error(`Azure API error: ${response.status} - ${errorText}`);
+      }
+
+      fetchSpan.setStatus({ code: SpanStatusCode.OK });
+      fetchSpan.end();
+
+      const data = await response.json() as ResponsesApiResponse;
+
+      if (data.status !== "completed") {
+        throw new Error(`Response not completed: ${data.status}`);
+      }
+
+      const assistantMessage = extractTextFromResponse(data);
+      console.log(`[Azure Agent] Response: ${assistantMessage.substring(0, 100)}...`);
+
+      span.setAttribute("response.id", data.id);
+      span.setAttribute("response.length", assistantMessage.length);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+
+      return {
+        message: assistantMessage,
+        threadId: data.id,
+        agentType,
+        suggestions: [],
+        conversationHistory: [
+          { role: "user" as const, content: message },
+          { role: "assistant" as const, content: assistantMessage }
+        ]
+      };
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
+      span.end();
+      throw error;
+    }
   });
-
-  const duration = ((performance.now() - startTime) / 1000).toFixed(2);
-  console.log(`[Azure Agent] Response received in ${duration}s - Status: ${response.status}`);
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Azure Agent] Error: ${errorText}`);
-    throw new Error(`Azure API error: ${response.status} - ${errorText}`);
-  }
-
-  const data = await response.json() as ResponsesApiResponse;
-
-  if (data.status !== "completed") {
-    throw new Error(`Response not completed: ${data.status}`);
-  }
-
-  const assistantMessage = extractTextFromResponse(data);
-  console.log(`[Azure Agent] Response: ${assistantMessage.substring(0, 100)}...`);
-
-  return {
-    message: assistantMessage,
-    // Use response ID as "threadId" for conversation continuity
-    threadId: data.id,
-    agentType,
-    suggestions: [],
-    conversationHistory: [
-      { role: "user", content: message },
-      { role: "assistant", content: assistantMessage }
-    ]
-  };
 }
 
 /**
@@ -245,64 +382,107 @@ export async function startAzureAgentChat(
 export async function continueAzureAgentChat(
   message: string,
   agentType: string,
-  previousResponseId: string
+  previousResponseId: string,
+  conversationId?: string
 ): Promise<AgentChatResponse> {
-  const startTime = performance.now();
+  return tracer.startActiveSpan("continueAzureAgentChat", async (span) => {
+    const startTime = performance.now();
+    const convId = conversationId || generateConversationId();
 
-  const token = await getToken();
-  const url = getResponsesUrl();
+    span.setAttribute("agent.name", agentName);
+    span.setAttribute("agent.type", agentType);
+    span.setAttribute("message.length", message.length);
+    span.setAttribute("previous_response_id", previousResponseId);
+    span.setAttribute("conversation.id", convId);
 
-  console.log(`[Azure Agent] Continuing chat, previous_response_id: ${previousResponseId}`);
+    try {
+      const token = await getToken();
+      const url = getResponsesUrl();
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      agent: { type: "agent_reference", name: agentName },
-      input: message,
-      previous_response_id: previousResponseId
-    }),
-  });
+      console.log(`[Azure Agent] Continuing chat, conversation: ${convId}, previous_response_id: ${previousResponseId}`);
 
-  const duration = ((performance.now() - startTime) / 1000).toFixed(2);
-  console.log(`[Azure Agent] Response received in ${duration}s - Status: ${response.status}`);
+      const fetchSpan = tracer.startSpan("fetch.responses.continue", {}, context.active());
+      fetchSpan.setAttribute("http.method", "POST");
+      fetchSpan.setAttribute("http.url", url);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Azure Agent] Error: ${errorText}`);
+      // Inject trace context headers for distributed tracing
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+        "x-ms-azsdk-telemetry": `galnet-ai;conversation_id=${convId}`,
+      };
+      propagation.inject(context.active(), headers);
 
-    // If previous response not found, start a new conversation
-    if (response.status === 404 || response.status === 400) {
-      console.warn("[Azure Agent] Previous response not found, starting new conversation");
-      return startAzureAgentChat(message, agentType);
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          agent: { type: "agent_reference", name: agentName },
+          input: message,
+          previous_response_id: previousResponseId,
+          metadata: {
+            conversation_id: convId,
+            source: "galnet-ai",
+          }
+        }),
+      });
+
+      const duration = ((performance.now() - startTime) / 1000).toFixed(2);
+      console.log(`[Azure Agent] Response received in ${duration}s - Status: ${response.status}`);
+
+      fetchSpan.setAttribute("http.status_code", response.status);
+      fetchSpan.setAttribute("response.duration_s", parseFloat(duration));
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[Azure Agent] Error: ${errorText}`);
+        fetchSpan.setStatus({ code: SpanStatusCode.ERROR, message: errorText });
+        fetchSpan.end();
+
+        // If previous response not found, start a new conversation
+        if (response.status === 404 || response.status === 400) {
+          console.warn("[Azure Agent] Previous response not found, starting new conversation");
+          span.setAttribute("fallback.new_conversation", true);
+          span.end();
+          return startAzureAgentChat(message, agentType);
+        }
+
+        throw new Error(`Azure API error: ${response.status} - ${errorText}`);
+      }
+
+      fetchSpan.setStatus({ code: SpanStatusCode.OK });
+      fetchSpan.end();
+
+      const data = await response.json() as ResponsesApiResponse;
+
+      if (data.status !== "completed") {
+        throw new Error(`Response not completed: ${data.status}`);
+      }
+
+      const assistantMessage = extractTextFromResponse(data);
+      console.log(`[Azure Agent] Response: ${assistantMessage.substring(0, 100)}...`);
+
+      span.setAttribute("response.id", data.id);
+      span.setAttribute("response.length", assistantMessage.length);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+
+      return {
+        message: assistantMessage,
+        threadId: data.id,
+        agentType,
+        suggestions: [],
+        conversationHistory: [
+          { role: "user" as const, content: message },
+          { role: "assistant" as const, content: assistantMessage }
+        ]
+      };
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
+      span.end();
+      throw error;
     }
-
-    throw new Error(`Azure API error: ${response.status} - ${errorText}`);
-  }
-
-  const data = await response.json() as ResponsesApiResponse;
-
-  if (data.status !== "completed") {
-    throw new Error(`Response not completed: ${data.status}`);
-  }
-
-  const assistantMessage = extractTextFromResponse(data);
-  console.log(`[Azure Agent] Response: ${assistantMessage.substring(0, 100)}...`);
-
-  return {
-    message: assistantMessage,
-    // Return new response ID for next message
-    threadId: data.id,
-    agentType,
-    suggestions: [],
-    conversationHistory: [
-      { role: "user", content: message },
-      { role: "assistant", content: assistantMessage }
-    ]
-  };
+  });
 }
 
 /**
@@ -313,30 +493,49 @@ export async function checkAzureHealth(): Promise<{
   responseTime?: number;
   error?: string;
 }> {
-  const startTime = performance.now();
+  return tracer.startActiveSpan("checkAzureHealth", async (span) => {
+    const startTime = performance.now();
 
-  try {
-    if (!projectEndpoint) {
+    try {
+      if (!projectEndpoint) {
+        span.setAttribute("error.type", "configuration");
+        span.setStatus({ code: SpanStatusCode.ERROR, message: "Endpoint not configured" });
+        span.end();
+        return {
+          isOnline: false,
+          error: "AZURE_EXISTING_AIPROJECT_ENDPOINT not configured"
+        };
+      }
+
+      // Try to get a token to verify authentication
+      await getToken();
+
+      const endTime = performance.now();
+      const responseTime = endTime - startTime;
+
+      span.setAttribute("health.online", true);
+      span.setAttribute("health.response_time_ms", responseTime);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+
+      return {
+        isOnline: true,
+        responseTime
+      };
+    } catch (error) {
+      const endTime = performance.now();
+      const responseTime = endTime - startTime;
+
+      span.setAttribute("health.online", false);
+      span.setAttribute("health.response_time_ms", responseTime);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: String(error) });
+      span.end();
+
       return {
         isOnline: false,
-        error: "AZURE_EXISTING_AIPROJECT_ENDPOINT not configured"
+        responseTime,
+        error: error instanceof Error ? error.message : "Unknown error"
       };
     }
-
-    // Try to get a token to verify authentication
-    await getToken();
-
-    const endTime = performance.now();
-    return {
-      isOnline: true,
-      responseTime: endTime - startTime
-    };
-  } catch (error) {
-    const endTime = performance.now();
-    return {
-      isOnline: false,
-      responseTime: endTime - startTime,
-      error: error instanceof Error ? error.message : "Unknown error"
-    };
-  }
+  });
 }

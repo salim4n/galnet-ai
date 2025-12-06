@@ -3,7 +3,7 @@ import { startAzureAgentChatStream } from "@/lib/agent/azure-agent";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { message, threadId } = body;
+    const { message, threadId, conversationId } = body;
 
     if (!message || typeof message !== "string") {
       return new Response(JSON.stringify({ error: "Message is required" }), {
@@ -12,12 +12,13 @@ export async function POST(request: Request) {
       });
     }
 
-    console.log("[API Stream] Starting stream for message:", message.substring(0, 50));
+    console.log("[API Stream] Starting stream for message:", message.substring(0, 50), conversationId ? `(conv: ${conversationId})` : "");
 
     const stream = await startAzureAgentChatStream(
       message,
       "galnet",
-      threadId
+      threadId,
+      conversationId
     );
 
     return new Response(stream, {

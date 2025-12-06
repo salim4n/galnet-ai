@@ -8,7 +8,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     console.log("[API] Request body:", JSON.stringify(body).substring(0, 200));
 
-    const { message, agentType = "galnet", threadId } = body;
+    const { message, agentType = "galnet", threadId, conversationId } = body;
 
     if (!message || typeof message !== "string") {
       console.log("[API] Invalid message");
@@ -18,15 +18,15 @@ export async function POST(request: Request) {
       );
     }
 
-    console.log("[API] Processing message:", message.substring(0, 50));
+    console.log("[API] Processing message:", message.substring(0, 50), conversationId ? `(conv: ${conversationId})` : "");
 
     let response;
     if (threadId) {
       console.log("[API] Continuing chat with threadId:", threadId);
-      response = await continueAzureAgentChat(message, agentType, threadId);
+      response = await continueAzureAgentChat(message, agentType, threadId, conversationId);
     } else {
       console.log("[API] Starting new chat");
-      response = await startAzureAgentChat(message, agentType);
+      response = await startAzureAgentChat(message, agentType, conversationId);
     }
 
     console.log("[API] Response received:", response.message?.substring(0, 100));
