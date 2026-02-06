@@ -19,7 +19,7 @@ export interface AgentChatResponse {
   conversationHistory: { role: 'user' | 'assistant'; content: string }[];
 }
 
-export interface AzureHealthResult {
+export interface HealthResult {
   isOnline: boolean;
   responseTime?: number;
   error?: string;

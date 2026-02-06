@@ -1,9 +1,9 @@
-import { startAzureAgentChatStream } from "@/lib/agent/azure-agent";
+import { startIgnitionAgentChatStream } from "@/lib/agent/ignition-agent";
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { message, threadId, conversationId } = body;
+    const { message, threadId } = body;
 
     if (!message || typeof message !== "string") {
       return new Response(JSON.stringify({ error: "Message is required" }), {
@@ -12,13 +12,12 @@ export async function POST(request: Request) {
       });
     }
 
-    console.log("[API Stream] Starting stream for message:", message.substring(0, 50), conversationId ? `(conv: ${conversationId})` : "");
+    console.log("[API Stream] Starting stream for message:", message.substring(0, 50));
 
-    const stream = await startAzureAgentChatStream(
+    const stream = await startIgnitionAgentChatStream(
       message,
       "galnet",
-      threadId,
-      conversationId
+      threadId || undefined
     );
 
     return new Response(stream, {

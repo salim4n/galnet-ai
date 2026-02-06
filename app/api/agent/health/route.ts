@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { checkAzureHealth } from "@/lib/agent/azure-agent";
+import { checkIgnitionHealth } from "@/lib/agent/ignition-agent";
 
 export async function GET() {
   try {
-    const health = await checkAzureHealth();
+    const health = await checkIgnitionHealth();
     return NextResponse.json(health);
   } catch (error) {
     return NextResponse.json(

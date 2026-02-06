@@ -52,15 +52,17 @@ This is an Elite Dangerous themed chat application called "GALNET Intelligence" 
 
 ## API Integration
 
-### Galnet Agent API
-- **Service file**: `lib/galnet-api.ts` contains API integration functions
-- **Endpoints**: Uses `/v2/agent/start-chat` and `/v2/agent/continue-chat`
-- **Configuration**: Set `NEXT_PUBLIC_API_BASE_URL` environment variable
-- **Error handling**: Includes retry logic for expired conversations
-- **Response format**: Supports ReAct format responses, extracts Final Answer
+### IgnitionRAG Agent API
+- **Backend service**: `lib/agent/ignition-agent.ts` connects to IgnitionRAG streaming API
+- **Client service**: `lib/galnet-api.ts` consumes Next.js API routes with SSE streaming
+- **API Routes**: `/api/agent` (non-streaming), `/api/agent/stream` (streaming SSE), `/api/agent/health`
+- **Streaming**: Server-Sent Events with `chunk`, `sources`, `done`, `error` event types
+- **Session management**: IgnitionRAG `sessionId` maintains conversation context
 
 ### Environment Variables
-- `NEXT_PUBLIC_API_BASE_URL`: Base URL for the Galnet API service
+- `IGNITION_API_BASE_URL`: IgnitionRAG API base URL (default: `https://ignitionrag.com`)
+- `IGNITION_AGENT_ID`: IgnitionRAG agent ID
+- `IGNITION_API_KEY`: IgnitionRAG API key
 - See `.env.example` for configuration template
 
 ## Development Notes

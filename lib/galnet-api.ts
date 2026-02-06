@@ -1,5 +1,5 @@
 // API service for Galnet agent integration
-// Uses local Next.js API routes that connect to Azure AI Foundry
+// Uses local Next.js API routes that connect to IgnitionRAG
 
 interface Suggestion {
   question: string

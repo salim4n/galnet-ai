@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { startAzureAgentChat, continueAzureAgentChat } from "@/lib/agent/azure-agent";
+import { startIgnitionAgentChat, continueIgnitionAgentChat } from "@/lib/agent/ignition-agent";
 
 export async function POST(request: Request) {
   console.log("[API] Received request");
@@ -8,7 +8,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     console.log("[API] Request body:", JSON.stringify(body).substring(0, 200));
 
-    const { message, agentType = "galnet", threadId, conversationId } = body;
+    const { message, agentType = "galnet", threadId } = body;
 
     if (!message || typeof message !== "string") {
       console.log("[API] Invalid message");
@@ -18,19 +18,19 @@ export async function POST(request: Request) {
       );
     }
 
-    console.log("[API] Processing message:", message.substring(0, 50), conversationId ? `(conv: ${conversationId})` : "");
+    console.log("[API] Processing message:", message.substring(0, 50));
 
     let response;
     if (threadId) {
-      console.log("[API] Continuing chat with threadId:", threadId);
-      response = await continueAzureAgentChat(message, agentType, threadId, conversationId);
+      console.log("[API] Continuing chat with sessionId:", threadId);
+      response = await continueIgnitionAgentChat(message, agentType, threadId);
     } else {
       console.log("[API] Starting new chat");
-      response = await startAzureAgentChat(message, agentType, conversationId);
+      response = await startIgnitionAgentChat(message, agentType);
     }
 
     console.log("[API] Response received:", response.message?.substring(0, 100));
-    console.log("[API] ThreadId:", response.threadId);
+    console.log("[API] SessionId:", response.threadId);
 
     return NextResponse.json(response);
   } catch (error) {
