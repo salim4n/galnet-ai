@@ -1,9 +1,12 @@
+import { IgnitionAI } from "@ignitionai/sdk";
 import type { AgentChatResponse } from "./types";
 
-// Configuration from environment
-const apiBaseUrl = process.env.IGNITION_API_BASE_URL || "https://ignitionrag.com";
 const agentId = process.env.IGNITION_AGENT_ID || "";
-const apiKey = process.env.IGNITION_API_KEY || "";
+
+const client = new IgnitionAI({
+  apiKey: process.env.IGNITION_API_KEY,
+  baseURL: process.env.IGNITION_BASE_URL || process.env.IGNITION_API_BASE_URL || undefined,
+});
 
 // Generate a unique session ID
 function generateSessionId(): string {
@@ -24,155 +27,74 @@ export async function startIgnitionAgentChatStream(
 
   console.log(`[Ignition Agent] Starting streaming chat, session: ${sid}`);
 
-  const url = `${apiBaseUrl}/api/agents/${agentId}/chat/stream`;
+  const encoder = new TextEncoder();
+  const streamStartTime = performance.now();
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      query: message,
-      sessionId: sid,
-      history: history || [],
-    }),
+  const sdkStream = client.agentChat.stream(agentId, {
+    query: message,
+    sessionId: sid,
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Ignition Agent] Error: ${response.status} - ${errorText}`);
-    throw new Error(`IgnitionRAG API error: ${response.status} - ${errorText}`);
-  }
-
-  if (!response.body) {
-    throw new Error("No response body from IgnitionRAG");
-  }
-
-  // Transform IgnitionRAG SSE format to our internal SSE format
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const streamStartTime = performance.now();
-  let sentStart = false;
-
-  let currentEvent = "";
-
-  const transformStream = new TransformStream<Uint8Array, Uint8Array>({
-    start(controller) {
-      // Emit start event immediately with session ID
-      sentStart = true;
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // Emit start event
       controller.enqueue(
         encoder.encode(`data: ${JSON.stringify({ type: "start", responseId: sid })}\n\n`)
       );
-    },
-    transform(chunk, controller) {
-      const text = decoder.decode(chunk, { stream: true });
-      const lines = text.split("\n");
 
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          currentEvent = line.slice(7).trim();
-        } else if (line.startsWith("data:")) {
-          const rawData = line.slice(5).trim();
-
-          switch (currentEvent) {
+      try {
+        for await (const event of sdkStream) {
+          switch (event.type) {
             case "chunk": {
-              // Data is a raw JSON string, e.g. "Hello"
-              if (rawData) {
-                try {
-                  const content = JSON.parse(rawData);
-                  if (typeof content === "string") {
-                    controller.enqueue(
-                      encoder.encode(`data: ${JSON.stringify({ type: "delta", content })}\n\n`)
-                    );
-                  } else if (content && typeof content === "object" && content.content) {
-                    controller.enqueue(
-                      encoder.encode(`data: ${JSON.stringify({ type: "delta", content: content.content })}\n\n`)
-                    );
-                  }
-                } catch {
-                  // Treat as raw text
-                  if (rawData) {
-                    controller.enqueue(
-                      encoder.encode(`data: ${JSON.stringify({ type: "delta", content: rawData })}\n\n`)
-                    );
-                  }
-                }
-              }
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify({ type: "delta", content: event.content })}\n\n`)
+              );
               break;
             }
             case "sources": {
-              try {
-                const sources = JSON.parse(rawData);
-                console.log(`[Ignition Agent] Sources received:`, Array.isArray(sources) ? sources.length : 0);
-              } catch {
-                // ignore
-              }
+              console.log(`[Ignition Agent] Sources received:`, event.sources?.length ?? 0);
               break;
             }
             case "tool_call": {
-              try {
-                const data = JSON.parse(rawData);
-                console.log(`[Ignition Agent] Tool call: ${data.name}`);
-              } catch {
-                // ignore
-              }
+              console.log(`[Ignition Agent] Tool call: ${event.name}`);
               break;
             }
             case "tool_result": {
-              try {
-                const data = JSON.parse(rawData);
-                console.log(`[Ignition Agent] Tool result: ${data.name}`);
-              } catch {
-                // ignore
-              }
-              break;
-            }
-            case "done": {
-              const durationMs = performance.now() - streamStartTime;
-              console.log(`[Ignition Agent] Stream completed - Session: ${sid}, Duration: ${(durationMs / 1000).toFixed(2)}s`);
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify({
-                  type: "done",
-                  responseId: sid,
-                  duration_ms: durationMs,
-                })}\n\n`)
-              );
-              break;
-            }
-            case "error": {
-              let errorMsg = "Unknown stream error";
-              try {
-                const data = JSON.parse(rawData);
-                errorMsg = data.message || errorMsg;
-              } catch {
-                // ignore
-              }
-              console.error(`[Ignition Agent] Stream error:`, errorMsg);
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify({
-                  type: "done",
-                  responseId: sid,
-                  error: errorMsg,
-                })}\n\n`)
-              );
+              console.log(`[Ignition Agent] Tool result: ${event.name}`);
               break;
             }
           }
-
-          // Reset event after processing data
-          currentEvent = "";
         }
+
+        const durationMs = performance.now() - streamStartTime;
+        console.log(`[Ignition Agent] Stream completed - Session: ${sid}, Duration: ${(durationMs / 1000).toFixed(2)}s`);
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({
+            type: "done",
+            responseId: sid,
+            duration_ms: durationMs,
+          })}\n\n`)
+        );
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : "Unknown stream error";
+        console.error(`[Ignition Agent] Stream error:`, errorMsg);
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({
+            type: "done",
+            responseId: sid,
+            error: errorMsg,
+          })}\n\n`)
+        );
+      } finally {
+        controller.close();
       }
     },
   });
-
-  return response.body.pipeThrough(transformStream);
 }
 
 /**
  * Start a non-streaming conversation with the IgnitionRAG agent.
- * Collects the full streamed response and returns it.
+ * Uses the SDK stream and collects the full response.
  */
 export async function startIgnitionAgentChat(
   message: string,
@@ -183,64 +105,15 @@ export async function startIgnitionAgentChat(
 
   console.log(`[Ignition Agent] Starting chat, session: ${sid}`);
 
-  const url = `${apiBaseUrl}/api/agents/${agentId}/chat/stream`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      query: message,
-      sessionId: sid,
-      history: [],
-    }),
+  const stream = client.agentChat.stream(agentId, {
+    query: message,
+    sessionId: sid,
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Ignition Agent] Error: ${response.status} - ${errorText}`);
-    throw new Error(`IgnitionRAG API error: ${response.status} - ${errorText}`);
-  }
-
-  if (!response.body) {
-    throw new Error("No response body from IgnitionRAG");
-  }
-
-  // Collect full response from stream
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
   let fullResponse = "";
-  let currentEvent = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    const text = decoder.decode(value, { stream: true });
-    const lines = text.split("\n");
-
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith("data:")) {
-        const rawData = line.slice(5).trim();
-        if (currentEvent === "chunk" && rawData) {
-          try {
-            const parsed = JSON.parse(rawData);
-            if (typeof parsed === "string") {
-              fullResponse += parsed;
-            } else if (parsed && typeof parsed === "object" && parsed.content) {
-              fullResponse += parsed.content;
-            }
-          } catch {
-            // Treat as raw text
-            fullResponse += rawData;
-          }
-        }
-        currentEvent = "";
-      }
+  for await (const event of stream) {
+    if (event.type === "chunk") {
+      fullResponse += event.content;
     }
   }
 
@@ -260,7 +133,7 @@ export async function startIgnitionAgentChat(
 
 /**
  * Continue an existing conversation with the IgnitionRAG agent.
- * Uses sessionId and history for conversation context.
+ * Uses sessionId for conversation context.
  */
 export async function continueIgnitionAgentChat(
   message: string,
@@ -282,32 +155,18 @@ export async function checkIgnitionHealth(): Promise<{
   const startTime = performance.now();
 
   try {
-    if (!agentId || !apiKey) {
+    if (!agentId || !process.env.IGNITION_API_KEY) {
       return {
         isOnline: false,
         error: "IGNITION_AGENT_ID or IGNITION_API_KEY not configured",
       };
     }
 
-    // List agents to check connectivity
-    const response = await fetch(`${apiBaseUrl}/api/agents`, {
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-      },
-    });
-
+    const agent = await client.agents.get(agentId);
     const responseTime = performance.now() - startTime;
 
-    if (!response.ok) {
-      return {
-        isOnline: false,
-        responseTime,
-        error: `API returned ${response.status}`,
-      };
-    }
-
     return {
-      isOnline: true,
+      isOnline: !!agent,
       responseTime,
     };
   } catch (error) {
